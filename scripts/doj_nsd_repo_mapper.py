@@ -18,14 +18,36 @@ OUT_MD = ROOT / "artifacts" / "doj-nsd-repo-map.md"
 OWNER = os.getenv("SONOXO_GITHUB_OWNER", "sonoxo")
 TOKEN = os.getenv("GITHUB_TOKEN", "")
 
+# Only action/news listings are allowed to produce repository review events.
+# Policy/organization pages are retained as authoritative evidence/context, but
+# their navigation links are deliberately excluded from the event stream.
 DOJ_SOURCES = {
-    "export_controls": "https://www.justice.gov/nsd/export-control-news",
-    "data_security": "https://www.justice.gov/nsd/public-actions-0",
-    "fara_foreign_influence": "https://www.justice.gov/nsd-fara",
-    "nsd_structure": "https://www.justice.gov/nsd/national-security-division-organization-chart",
+    "export_controls": {
+        "url": "https://www.justice.gov/nsd/export-control-news",
+        "extract_actions": True,
+    },
+    "data_security": {
+        "url": "https://www.justice.gov/nsd/public-actions-0",
+        "extract_actions": True,
+    },
+    "fara_foreign_influence": {
+        "url": "https://www.justice.gov/nsd-fara",
+        "extract_actions": False,
+    },
+    "nsd_structure": {
+        "url": "https://www.justice.gov/nsd/national-security-division-organization-chart",
+        "extract_actions": False,
+    },
 }
 
-USER_AGENT = "SonoxoDOJNSDMapper/1.0 (+compliance evidence; contact repository owner)"
+USER_AGENT = "SonoxoDOJNSDMapper/1.1 (+compliance evidence; contact repository owner)"
+ACTION_PATH_RE = re.compile(r"/(?:opa|usao-[^/]+|nsd)/(?:pr|press-release)/", re.I)
+ACTION_TITLE_TERMS = (
+    "charged", "pleads", "pleaded", "pleads guilty", "sentenced", "convicted",
+    "indict", "arrest", "settlement", "resolution", "declination", "enforcement",
+    "penalty", "fine", "seizure", "forfeiture", "export", "sanction", "data security",
+    "prohibited transaction", "covered transaction", "compliance order",
+)
 
 
 def request(url: str, accept: str = "text/html") -> tuple[bytes, str, int]:
@@ -45,6 +67,23 @@ def clean_text(raw: str) -> str:
     return re.sub(r"\s+", " ", html.unescape(raw)).strip()
 
 
+def is_action_record(absolute: str, title: str) -> bool:
+    parsed = urllib.parse.urlparse(absolute)
+    if parsed.netloc not in {"www.justice.gov", "justice.gov"}:
+        return False
+    # Exclude listing filters, search/navigation and the source index itself.
+    if parsed.query or parsed.fragment:
+        return False
+    path = parsed.path.rstrip("/")
+    if ACTION_PATH_RE.search(path + "/"):
+        return True
+    # DOJ Drupal press releases can occasionally live in component-specific paths.
+    # Require both a meaningful enforcement/action term and a sufficiently deep path.
+    title_l = title.lower()
+    depth = len([segment for segment in path.split("/") if segment])
+    return depth >= 3 and any(term in title_l for term in ACTION_TITLE_TERMS)
+
+
 def extract_doj_items(source_name: str, url: str, body: bytes) -> list[dict]:
     text = body.decode("utf-8", errors="replace")
     items: list[dict] = []
@@ -54,24 +93,25 @@ def extract_doj_items(source_name: str, url: str, body: bytes) -> list[dict]:
         if len(title) < 18:
             continue
         absolute = urllib.parse.urljoin(url, html.unescape(href))
-        if "justice.gov" not in absolute:
+        if not is_action_record(absolute, title):
             continue
-        key = f"{title}|{absolute}"
+        key = absolute.rstrip("/")
         if key in seen:
             continue
         seen.add(key)
         items.append({"source": source_name, "title": title[:500], "url": absolute})
-    return items[:120]
+    return items[:100]
 
 
 def fetch_doj() -> tuple[list[dict], dict]:
     all_items: list[dict] = []
     evidence: dict = {}
-    for name, url in DOJ_SOURCES.items():
+    for name, spec in DOJ_SOURCES.items():
+        url = spec["url"]
         try:
             body, final_url, status = request(url)
             digest = hashlib.sha256(body).hexdigest()
-            extracted = extract_doj_items(name, final_url, body)
+            extracted = extract_doj_items(name, final_url, body) if spec["extract_actions"] else []
             all_items.extend(extracted)
             evidence[name] = {
                 "ok": 200 <= status < 400,
@@ -80,13 +120,19 @@ def fetch_doj() -> tuple[list[dict], dict]:
                 "final_url": final_url,
                 "sha256": digest,
                 "bytes": len(body),
+                "extract_actions": spec["extract_actions"],
                 "items_extracted": len(extracted),
             }
         except Exception as exc:
-            evidence[name] = {"ok": False, "source": url, "error": str(exc)}
+            evidence[name] = {
+                "ok": False,
+                "source": url,
+                "extract_actions": spec["extract_actions"],
+                "error": str(exc),
+            }
     dedup: dict[str, dict] = {}
     for item in all_items:
-        dedup[item["url"]] = item
+        dedup[item["url"].rstrip("/")] = item
     return list(dedup.values()), evidence
 
 
@@ -165,9 +211,9 @@ def assess(repos: list[dict], items: list[dict], config: dict) -> list[dict]:
             "severity": severity,
             "relevant_doj_items": relevant[:20],
             "note": (
-                "Repository naming/metadata overlaps a DOJ NSD compliance domain. Review actual transactions, users, counterparties, data, exports, and contracts before deciding applicability."
+                "Repository metadata intersects a verified DOJ public-action domain. Review actual transactions, users, counterparties, data, exports, and contracts before deciding legal applicability."
                 if relevant else
-                "No DOJ NSD domain intersection detected from repository metadata and current mapped announcements."
+                "No verified DOJ public-action domain intersection detected from current repository metadata."
             ),
         })
     return sorted(results, key=lambda x: ({"high": 0, "medium": 1, "none": 2}.get(x["severity"], 3), x["repository"].lower()))
@@ -179,9 +225,9 @@ def render_markdown(payload: dict) -> str:
         "",
         f"Generated: {payload['checked_at']}",
         "",
-        "This is a compliance triage map, not a legal certification. REVIEW means repository metadata intersects a current DOJ NSD enforcement/policy domain; HOLD/BLOCK require transaction-specific or verified-prohibition evidence.",
+        "This is a compliance triage map, not a legal certification. REVIEW means repository metadata intersects a verified DOJ public-action domain; HOLD/BLOCK require transaction-specific or verified-prohibition evidence.",
         "",
-        "| Repository | Decision | Severity | Domains | DOJ items |",
+        "| Repository | Decision | Severity | Domains | DOJ actions |",
         "|---|---|---|---|---:|",
     ]
     for row in payload["repositories"]:
@@ -189,8 +235,14 @@ def render_markdown(payload: dict) -> str:
         lines.append(f"| `{row['repository']}` | **{row['decision']}** | {row['severity']} | {domains} | {len(row['relevant_doj_items'])} |")
     lines.extend(["", "## Verified DOJ source evidence", ""])
     for name, ev in payload["source_evidence"].items():
-        lines.append(f"- **{name}**: {'OK' if ev.get('ok') else 'FAILED'} — {ev.get('source')} — sha256 `{ev.get('sha256','n/a')}`")
-    lines.extend(["", "## Decision semantics", "", "- **PASS** — no mapped intersection from current evidence; not a blanket legal clearance.", "- **REVIEW** — domain overlap exists; inspect actual business activity and counterparties.", "- **HOLD** — use when transaction-specific facts indicate licensing/registration/approval may be required before proceeding.", "- **BLOCK** — use only when a verified prohibition or denied authorization applies."])
+        lines.append(f"- **{name}**: {'OK' if ev.get('ok') else 'FAILED'} — {ev.get('source')} — sha256 `{ev.get('sha256','n/a')}` — actions `{ev.get('items_extracted',0)}`")
+    lines.extend([
+        "", "## Decision semantics", "",
+        "- **PASS** — no mapped intersection from current verified action evidence; not a blanket legal clearance.",
+        "- **REVIEW** — verified DOJ action-domain overlap exists; inspect actual business activity and counterparties.",
+        "- **HOLD** — use when transaction-specific facts indicate licensing/registration/approval may be required before proceeding.",
+        "- **BLOCK** — use only when a verified prohibition or denied authorization applies.",
+    ])
     return "\n".join(lines) + "\n"
 
 
@@ -215,18 +267,19 @@ def main() -> int:
         "hold": sum(1 for r in assessed if r["decision"] == "HOLD"),
         "block": sum(1 for r in assessed if r["decision"] == "BLOCK"),
         "high_severity_reviews": sum(1 for r in assessed if r["decision"] == "REVIEW" and r["severity"] == "high"),
-        "doj_items_scanned": len(items),
+        "doj_actions_scanned": len(items),
     }
     payload = {
         "checked_at": checked_at,
         "owner": OWNER,
-        "policy": "DOJ NSD verified-source repository triage",
+        "policy": "DOJ NSD verified-public-action repository triage",
         "summary": summary,
         "source_evidence": source_evidence,
         "repositories": assessed,
         "guardrails": {
             "x_feed_is_alert_only": True,
             "justice_gov_verification_required": True,
+            "policy_pages_are_context_not_incidents": True,
             "hold_requires_transaction_context": True,
             "block_requires_verified_prohibition": True,
         },
@@ -236,8 +289,8 @@ def main() -> int:
     OUT_MD.write_text(render_markdown(payload), encoding="utf-8")
     print(json.dumps(summary, indent=2, sort_keys=True))
 
-    failed_sources = [name for name, ev in source_evidence.items() if not ev.get("ok")]
-    return 1 if failed_sources else 0
+    action_sources = [ev for ev in source_evidence.values() if ev.get("extract_actions")]
+    return 1 if action_sources and not any(ev.get("ok") for ev in action_sources) else 0
 
 
 if __name__ == "__main__":
